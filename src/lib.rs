@@ -13,6 +13,8 @@ static VS_ENTRY_POINT: &str = "vs_main";
 static FS_ENTRY_POINT_LINEAR: &str = "fs_main_linear";
 static FS_ENTRY_POINT_SRGB: &str = "fs_main_srgb";
 
+static EMULATED_VTX_OFFSET: bool = cfg!(target_arch = "wasm32") && size_of::<DrawIdx>() == 2;
+
 pub type RendererResult<T> = Result<T, RendererError>;
 
 #[repr(transparent)]
@@ -336,6 +338,7 @@ pub struct RenderData {
     vertex_buffer_size: usize,
     index_buffer: Option<Buffer>,
     index_buffer_size: usize,
+    index_format: IndexFormat,
     draw_list_offsets: SmallVec<[(i32, u32); 4]>,
     render: bool,
 }
@@ -537,6 +540,15 @@ impl Renderer {
         let fb_width = draw_data.display_size[0] * draw_data.framebuffer_scale[0];
         let fb_height = draw_data.display_size[1] * draw_data.framebuffer_scale[1];
 
+        // On WASM with 16-bit indices, force 32-bit to emulate vertex offset
+        let index_format = if EMULATED_VTX_OFFSET {
+            IndexFormat::Uint32
+        } else if size_of::<DrawIdx>() == 2 {
+            IndexFormat::Uint16
+        } else {
+            IndexFormat::Uint32
+        };
+
         let mut render_data = render_data.unwrap_or_else(|| RenderData {
             fb_size: [fb_width, fb_height],
             last_size: [0.0, 0.0],
@@ -545,6 +557,7 @@ impl Renderer {
             vertex_buffer_size: 0,
             index_buffer: None,
             index_buffer_size: 0,
+            index_format,
             draw_list_offsets: SmallVec::<[_; 4]>::new(),
             render: false,
         });
@@ -603,13 +616,38 @@ impl Renderer {
         }
 
         let mut vertices = Vec::with_capacity(vertex_count * std::mem::size_of::<DrawVertPod>());
-        let mut indices = Vec::with_capacity(index_count * std::mem::size_of::<DrawIdx>());
+        let mut indices = Vec::with_capacity(index_count * render_data.index_format.byte_size());
 
-        for draw_list in draw_data.draw_lists() {
+        for (draw_list, &(vertex_base, _)) in draw_data.draw_lists().zip(render_data.draw_list_offsets.iter()) {
             // Safety: DrawVertPod is #[repr(transparent)] over DrawVert and DrawVert _should_ be Pod.
             let vertices_pod: &[DrawVertPod] = unsafe { draw_list.transmute_vtx_buffer() };
             vertices.extend_from_slice(bytemuck::cast_slice(vertices_pod));
-            indices.extend_from_slice(bytemuck::cast_slice(draw_list.idx_buffer()));
+
+            if EMULATED_VTX_OFFSET {
+                // Process indices per-command to handle vtx_offset
+                let idx_buffer = draw_list.idx_buffer();
+                for cmd in draw_list.commands() {
+                    if let Elements { count, cmd_params } = cmd {
+                        let src_idx_start = cmd_params.idx_offset;
+                        let src_idx_end = src_idx_start + count;
+                        
+                        // Calculate the effective vertex offset for this command
+                        let effective_offset = (vertex_base + cmd_params.vtx_offset as i32) as u32;
+                        
+                        // Adjust indices for this specific command
+                        for &idx in &idx_buffer[src_idx_start..src_idx_end] {
+                            let adjusted_idx = if size_of::<DrawIdx>() == 2 {
+                                idx as u32 + effective_offset
+                            } else {
+                                idx as u32 + effective_offset
+                            };
+                            indices.extend_from_slice(&adjusted_idx.to_ne_bytes());
+                        }
+                    }
+                }
+            } else {
+                indices.extend_from_slice(bytemuck::cast_slice(draw_list.idx_buffer()));
+            }
         }
 
         // Copies in wgpu must be padded to 4 byte alignment
@@ -680,7 +718,7 @@ impl Renderer {
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
         rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
-        rpass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint16);
+        rpass.set_index_buffer(index_buffer.slice(..), render_data.index_format);
 
         // Execute all the imgui render work.
         for (draw_list, bases) in draw_data
@@ -723,8 +761,12 @@ impl Renderer {
         clip_scale: [f32; 2],
         (vertex_base, index_base): (i32, u32),
     ) -> RendererResult<()> {
+        let mut current_idx_offset = index_base;
         for cmd in draw_list.commands() {
             if let Elements { count, cmd_params } = cmd {
+                let idx_offset = current_idx_offset;
+                current_idx_offset += count as u32;
+
                 let clip_rect = [
                     (cmd_params.clip_rect[0] - clip_off[0]) * clip_scale[0],
                     (cmd_params.clip_rect[1] - clip_off[1]) * clip_scale[1],
@@ -767,12 +809,26 @@ impl Renderer {
                     if scissors.2 > 0 && scissors.3 > 0 {
                         rpass.set_scissor_rect(scissors.0, scissors.1, scissors.2, scissors.3);
 
-                        // Draw the current batch of vertices with the renderpass.
-                        rpass.draw_indexed(
-                            start..end,
-                            vertex_base + cmd_params.vtx_offset as i32,
-                            0..1,
-                        );
+                        if EMULATED_VTX_OFFSET {
+                            // on WASM with imgui running with 16-bit indices,
+                            // we have to emulate VtxOffset and we do this by
+                            // adjusting the indices manually during buffer
+                            // upload. So here we can just draw with zero offset.
+                            let start = idx_offset;
+                            let end = start + count as u32;
+                            rpass.draw_indexed(
+                                start..end,
+                                0,
+                                0..1,
+                            );
+                        } else {
+                            // Draw the current batch of vertices with the renderpass.
+                            rpass.draw_indexed(
+                                start..end,
+                                vertex_base + cmd_params.vtx_offset as i32,
+                                0..1,
+                            );
+                        }
                     }
                 }
             }
