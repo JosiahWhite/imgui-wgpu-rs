@@ -43,7 +43,7 @@ min = 0                                                                         
 
 [dependencies]
 bytemuck = "1"
-imgui = { git = "https://github.com/tsurucapital/imgui-rs.git" }
+imgui = { git = "https://github.com/JosiahWhite/imgui-rs.git", rev = "9b7fad059faa692de6e431ac55ee2690e216a6c7" }
 log = "0.4"
 smallvec = "1"
 wgpu = "25.0.0"
@@ -53,9 +53,9 @@ bytemuck = { version = "1.13", features = ["derive"] }
 cgmath = "0.18"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
-imgui-winit-support = { git = "https://github.com/tsurucapital/imgui-rs.git" }
+imgui-winit-support = { git = "https://github.com/JosiahWhite/imgui-rs.git", rev = "9b7fad059faa692de6e431ac55ee2690e216a6c7"}
 pollster = "0.4"
-raw-window-handle = "0.5"
+raw-window-handle = "0.6"
 winit = "0.30"
 
 [package.metadata.docs.rs]
